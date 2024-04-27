@@ -1,0 +1,185 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def srsFillContinousUpAndDown(srs):
+    '''
+    这一步主要取消掉连续的上涨或者下跌，二合一
+    input: close series
+    return srs[effective index]
+    '''
+    srsPct = srs.pct_change()
+    eff = (np.sign(srsPct).fillna(0)).rolling(2).apply(lambda x: x.prod()).apply(
+        lambda x: True if x == -1 else False).shift(-1).fillna(True)
+    return srs.loc[eff]
+
+
+class status(object):
+    '''
+    trend: 可能为up，down，upDraw，downDraw，minority
+    upperLim\lowerLim: 高/低关键点
+    reverseThreshold拐点的最低标准，以下称阈值
+    margin有效突破的标准，以下称边际值
+    '''
+
+    def __init__(self, trend=None, upperLim=None, lowerLim=None, reverseThreshold=0.05, margin=0.02):
+        self.trend, self.upperLim, self.lowerLim = trend, upperLim, lowerLim
+        self.reverseThreshold, self.margin = reverseThreshold, margin
+
+        self.lstKeyDates = []
+        self.logger = pd.DataFrame(columns=["trend", "upperLim", "lowerLim"])
+
+    def __str__(self):
+        dictTrend = {"up": "上行趋势", "down": "下行趋势", "upDraw": "自然回撤",
+                     "downDraw": "自然反弹", "minority": "次要波动"}
+        return f'''当前处于{dictTrend[self.trend]}中，
+                   关键高点为{self.upperLim:.2f}，
+                   关键低点为{self.lowerLim:.2f}。'''
+
+    def upperUpdate(self, newPoint, date):
+        self.upperLim = newPoint
+        self.lstKeyDates[-1] = date
+
+    def upperBreak(self, newPoint, date):
+        self.upperLim = newPoint
+        self.lstKeyDates.append(date)
+
+    def lowerUpdate(self, newPoint, date):
+        self.lowerLim = newPoint
+        self.lstKeyDates[-1] = date
+
+    def lowerBreak(self, newPoint, date):
+        self.lowerLim = newPoint
+        self.lstKeyDates.append(date)
+
+    def renew(self, newPoint, date):
+        # 上行趋势中的判别
+        if self.trend == "up":
+            if newPoint > self.upperLim:
+                self.upperUpdate(newPoint, date)  # 如果新高则继续上行；更新高关键点
+            elif newPoint <= self.lowerLim * (1 - self.margin):
+                self.trend = "down"
+                self.lowerBreak(newPoint, date)  # 如果未新高且有效突破下限则下行；更新低关键点
+            elif newPoint <= self.upperLim * (1 - self.reverseThreshold):
+                self.trend = "upDraw"
+                self.lowerBreak(newPoint, date)  # 如果未新高且未有效突破下限且足量回撤则自然回撤；更新低关键点
+        # 下行趋势中的判别
+        elif self.trend == "down":
+            if newPoint < self.lowerLim:
+                self.lowerUpdate(newPoint, date)  # 如果回落则继续下行；更新低关键点
+            elif newPoint >= self.upperLim * (1 + self.margin):
+                self.trend = "up"
+                self.upperBreak(newPoint, date)  # 如果未回落且有效突破上限则上行；更新高关键点
+            elif newPoint >= self.lowerLim * (1 + self.reverseThreshold):
+                self.trend = "upDraw"
+                self.upperBreak(newPoint, date)  # 如果未回落且未有效突破上限但足量反弹则自然反弹；更新高关键点
+        # 自然回撤中的判断
+        elif self.trend == "upDraw":
+            if newPoint <= self.lowerLim:
+                self.lowerUpdate(newPoint, date)  # 如果未反弹则继续自然回撤；更新低关键点
+            elif newPoint >= self.upperLim * (1 + self.margin):
+                self.trend = "up"
+                self.upperBreak(newPoint, date)  # 如果反弹且有效突破上限则上行；更新高关键点
+            elif newPoint >= self.lowerLim * (1 + self.reverseThreshold):
+                self.trend = "minority"
+                self.lstKeyDates.append(date)  # 如果反弹但未有效突破上限且足量反弹则次要波动
+        # 次要波动
+        elif self.trend == "minority":
+            if newPoint >= self.upperLim * (1 + self.margin):
+                self.trend = "up"
+                self.upperBreak(newPoint, date)  # 如果反弹且有效突破上限则上行；更新高关键点
+            elif newPoint <= self.lowerLim * (1 - self.margin):
+                self.trend = "down"
+                self.lowerBreak(newPoint, date)  # 如果回落且有效突破下限则下行；更新低关键点
+        self.logger.loc[date] = [self.trend, self.upperLim, self.lowerLim]
+
+
+class LivermoreAnalysis(object):
+    def __init__(self, data):
+        '''
+        data必为pd.Series格式
+        self.status为状态单元
+        '''
+        self.data = data
+        self.status = status()
+
+    def initSeries(self, thres=0.02):
+        srs = self.data.copy()
+        srs = srsFillContinousUpAndDown(srs)
+        _srs01 = ((srs.pct_change() + 1.0).cumprod() - 1.0). \
+            apply(lambda x: x if abs(x) >= thres else np.nan)
+        initIndex = _srs01.first_valid_index()
+        self.status.lstKeyDates = [srs.index[0], initIndex]
+
+        self.status.trend = "up" if _srs01[initIndex] > 0 else "down"
+        if self.status.trend == "up":
+            self.status.upperLim, self.status.lowerLim = srs[initIndex], srs[0]
+        else:
+            self.status.upperLim, self.status.lowerLim = srs[0], srs[initIndex]
+        return srs, initIndex
+
+    def srsAnalysis(self, initThres, reverseThreshold, margin, fig=True):
+        srs, initIndex = self.initSeries(initThres)
+        self.status.reverseThreshold, self.status.margin = reverseThreshold, margin
+        start = srs.index[srs.index.get_loc(initIndex) + 1]
+        for date in srs[start:].index:
+            newPoint = srs[date]
+            self.status.renew(newPoint, date)
+        if fig:
+            print(srs.name, self.status.trend)
+            # srs2plot = srsFillContinousUpAndDown(srs[self.status.lstKeyDates]).plot(figsize=(15, 10))
+            # plt.show(block=True)
+            # plt.close()
+        return srs[self.status.lstKeyDates], self.status
+
+
+'''示例：假设srs为某债券价格走势，我们定义 20bps以上考虑反转，突破关键点20bps以上认定有效突破，那么只需要进行如下操作即可。'''
+data = pd.read_excel(r'D:\我的坚果云\1YF\my py\reference_model.xlsx', index_col=0)
+# # ['000852.SH', '000300.SH', 'HSCI.HI', 'USDCNH.FX', 'JJRI.WI', 'NMFI.wi', 'TY.CBT', 'T.CFE']
+# # ['中证1000', '沪深300', '恒指', '美元兑离岸人民币', 'WIND煤焦钢矿', '贵金属', '10Y美债', '10Y国债']
+data.index = data.index.astype(str)
+print(data.index[-1])
+print('-----')
+
+for i in ['000852.SH', '000300.SH', 'HSCI.HI']:
+    srs = data[i]
+    print(i)
+    lv = LivermoreAnalysis(srs)
+    for j in np.arange(0.02, 0.1, 0.01):
+        a, b = lv.srsAnalysis(0.02, j, 0.01, fig=True)
+
+for i in ['USDCNH.FX', 'TY.CBT', 'T.CFE']:
+    srs = data[i]
+    print(i)
+    lv = LivermoreAnalysis(srs)
+    for j in np.arange(0.002, 0.009, 0.001):
+        a, b = lv.srsAnalysis(0.02, j, 0.01, fig=True)
+
+for i in ['JJRI.WI']: #, 'NFFI.WI']:
+    srs = data[i]
+    print(i)
+    lv = LivermoreAnalysis(srs)
+    for j in np.arange(0.01, 0.1, 0.01):
+        a, b = lv.srsAnalysis(0.02, j, 0.01, fig=True)
+
+for i in ['NMFI.wi']:
+    srs = data[i]
+    print(i)
+    lv = LivermoreAnalysis(srs)
+    for j in np.arange(0.01, 0.1, 0.01):
+        a, b = lv.srsAnalysis(0.02, j, 0.01, fig=True)
+
+# x = pd.DataFrame(srs[b.lstKeyDates].copy())
+# x.to_excel(i + '_' + data.index[-1] + '.xlsx')
+
+'''
+000852.SH  (0.02, 0.05, 0.01)
+000300.SH  (0.02, 0.05, 0.01)
+HSCI.HI    (0.02, 0.05, 0.01)
+USDCNH.FX  (0.02, 0.005, 0.01)
+JJRI.WI    (0.02, 0.07, 0.01)
+NMFI.wi    (0.02, 0.03, 0.01)
+TY.CBT     (0.02, 0.005, 0.01)
+T.CFE      (0.02, 0.005, 0.01)
+'''
